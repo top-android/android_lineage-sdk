@@ -19,7 +19,6 @@ import android.net.LinkProperties;
 import android.net.Network;
 import android.net.NetworkCapabilities;
 import android.net.NetworkRequest;
-import android.net.TrafficStats;
 import android.os.Handler;
 import android.os.Message;
 import android.os.SystemClock;
@@ -34,6 +33,9 @@ import lineageos.providers.LineageSettings;
 
 import org.lineageos.platform.internal.R;
 
+import java.io.BufferedReader;
+import java.io.FileReader;
+import java.io.IOException;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.stream.Stream;
@@ -45,6 +47,12 @@ public class NetworkTraffic extends TextView {
 
     // This must match the interface prefix in Connectivity's clatd.c.
     private static final String CLAT_PREFIX = "v4-";
+
+    // Kernel per-interface byte counters. TrafficStats is backed by eBPF on
+    // Android 17, and netd.bpf cannot load on this device's 4.14 kernel, so the
+    // counters are read straight from the kernel instead.
+    private static final String PROC_NET_DEV = "/proc/net/dev";
+    private static boolean sProcNetDevErrorLogged;
 
     private static final int MODE_DISABLED = 0;
     private static final int MODE_UPSTREAM_ONLY = 1;
@@ -171,9 +179,16 @@ public class NetworkTraffic extends TextView {
                         .map(link -> link.getInterfaceName()).filter(iface -> iface != null)
                         .flatMap(iface -> Stream.of(iface, CLAT_PREFIX + iface))
                         .toArray(String[]::new);
+                final HashMap<String, long[]> ifaceStats = readProcNetDev();
+                if (ifaceStats.isEmpty()) {
+                    // Counters unavailable this round; keep the previous sample so the
+                    // next successful read does not report a bogus spike.
+                    return;
+                }
                 for (String iface : ifaces) {
-                    final long ifaceTxBytes = TrafficStats.getTxBytes(iface);
-                    final long ifaceRxBytes = TrafficStats.getRxBytes(iface);
+                    final long[] stats = ifaceStats.get(iface);
+                    final long ifaceRxBytes = stats != null ? stats[0] : 0;
+                    final long ifaceTxBytes = stats != null ? stats[1] : 0;
                     if (DEBUG) {
                         Log.d(TAG, "adding stats from interface " + iface
                                 + " txbytes " + ifaceTxBytes + " rxbytes " + ifaceRxBytes);
@@ -534,6 +549,52 @@ public class NetworkTraffic extends TextView {
             mDrawable.setColorFilter(
                     new PorterDuffColorFilter(mIconTint, PorterDuff.Mode.MULTIPLY));
         }
+    }
+
+    /**
+     * Reads per-interface byte counters from /proc/net/dev.
+     *
+     * Android 17 takes these numbers from eBPF (netd.bpf). On this device the
+     * kernel is 4.14 and netd.bpf never loads (blocked_ports_map EINVAL, zero
+     * programs attached), so TrafficStats reports UNSUPPORTED for every
+     * interface and the monitor would stay at 0. The kernel's own counters are
+     * fine, so read them directly.
+     *
+     * @return interface name -> {rxBytes, txBytes}; empty if the file is unreadable
+     */
+    private static HashMap<String, long[]> readProcNetDev() {
+        final HashMap<String, long[]> stats = new HashMap<>();
+        try (BufferedReader reader = new BufferedReader(new FileReader(PROC_NET_DEV))) {
+            String line;
+            while ((line = reader.readLine()) != null) {
+                // Format: "  wlan0: 12345 67 0 0 0 0 0 0 890 12 0 0 0 0 0 0"
+                final int colon = line.indexOf(':');
+                if (colon < 0) {
+                    continue; // the two header lines
+                }
+                final String iface = line.substring(0, colon).trim();
+                final String[] fields = line.substring(colon + 1).trim().split("\\s+");
+                // rx_bytes is field 0 and tx_bytes is field 8, out of 16
+                if (fields.length < 9) {
+                    continue;
+                }
+                try {
+                    stats.put(iface, new long[] {
+                            Long.parseLong(fields[0]),
+                            Long.parseLong(fields[8])
+                    });
+                } catch (NumberFormatException e) {
+                    Log.w(TAG, "Malformed line in " + PROC_NET_DEV + ": " + line);
+                }
+            }
+        } catch (IOException e) {
+            if (!sProcNetDevErrorLogged) {
+                sProcNetDevErrorLogged = true;
+                Log.w(TAG, "Failed to read " + PROC_NET_DEV
+                        + ", traffic monitor will not update", e);
+            }
+        }
+        return stats;
     }
 
     private static class LinkPropertiesHolder {
